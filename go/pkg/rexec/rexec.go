@@ -22,6 +22,7 @@ import (
 	repb "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	log "github.com/golang/glog"
 	tspb "github.com/golang/protobuf/ptypes/timestamp"
+	bspb "google.golang.org/genproto/googleapis/bytestream"
 )
 
 // Client is a remote execution client.
@@ -252,6 +253,36 @@ func (ec *Context) UpdateCachedResult() {
 	}
 }
 
+func printLogStream(streamResourceName string, ec *Context) {
+	log.V(1).Infof("Reading stream [%s]", streamResourceName)
+
+	readRequest := bspb.ReadRequest{
+		ResourceName: streamResourceName,
+		ReadOffset:   0,
+		ReadLimit:    0}
+
+	stream, err := ec.client.GrpcClient.Read(ec.ctx, &readRequest)
+	log.V(1).Infof("Read request sent [%s]", readRequest)
+	if err != nil {
+		log.V(1).Infof("Error reading [%s]: %s", streamResourceName, err)
+		return
+	}
+
+	// This does not seem to work: Recv() blocks forever. (Why?)
+	for {
+		log.V(1).Infof("recv() loop")
+		resp, err := stream.Recv()
+		log.V(1).Infof("recv() returned")
+
+		if err != nil {
+			log.V(1).Infof("Error reading")
+			return
+		}
+
+		log.V(1).Infof("Received %d:", len(resp.Data))
+	}
+}
+
 // ExecuteRemotely tries to execute the command remotely and download the results. It uploads any
 // missing inputs first.
 func (ec *Context) ExecuteRemotely() {
@@ -272,11 +303,32 @@ func (ec *Context) ExecuteRemotely() {
 	ec.Metadata.MissingDigests = missing
 	log.V(1).Infof("%s> Executing remotely...\n%s", cmdID, strings.Join(ec.cmd.Args, " "))
 	ec.Metadata.EventTimes[command.EventExecuteRemotely] = &command.TimeInterval{From: time.Now()}
-	op, err := ec.client.GrpcClient.ExecuteAndWait(ec.ctx, &repb.ExecuteRequest{
+
+	// Spawn threads to start reading and printing the outputs only for the first update:
+	outputStreamsReadingInProgress := false
+	processProgressCallback := func(metadata *repb.ExecuteOperationMetadata) {
+		log.V(1).Infof("Got ExecuteOperationMetadata for [%s] in stage %s",
+			metadata.ActionDigest, metadata.Stage)
+
+		if !outputStreamsReadingInProgress {
+			if len(metadata.StdoutStreamName) > 0 {
+				go printLogStream(metadata.StdoutStreamName, ec)
+				outputStreamsReadingInProgress = true
+			}
+
+			if len(metadata.StderrStreamName) > 0 {
+				go printLogStream(metadata.StderrStreamName, ec)
+				outputStreamsReadingInProgress = true
+			}
+
+		}
+	}
+
+	op, err := ec.client.GrpcClient.ExecuteAndWaitProgress(ec.ctx, &repb.ExecuteRequest{
 		InstanceName:    ec.client.GrpcClient.InstanceName,
 		SkipCacheLookup: !ec.opt.AcceptCached || ec.opt.DoNotCache,
 		ActionDigest:    ec.Metadata.ActionDigest.ToProto(),
-	})
+	}, processProgressCallback)
 	ec.Metadata.EventTimes[command.EventExecuteRemotely].To = time.Now()
 	if err != nil {
 		ec.Result = command.NewRemoteErrorResult(err)
